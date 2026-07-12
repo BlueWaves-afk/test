@@ -109,3 +109,33 @@ def extract(req: ExtractRequest) -> dict:
     )
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     return json.loads(text)
+
+
+# ── Dynamic Extract ───────────────────────────────────────────────────────────
+
+class DynamicExtractRequest(BaseModel):
+    text: str
+    schema: dict[str, str]
+
+
+@app.post("/dynamic-extract")
+def dynamic_extract(req: DynamicExtractRequest) -> dict:
+    schema_lines = "\n".join(f"  - {k}: {v}" for k, v in req.schema.items())
+    system = f"""You are a structured data extractor. Extract fields from the given text according to the schema below and return a single JSON object with no other text.
+
+Schema (field: type):
+{schema_lines}
+
+Rules:
+- Return EXACTLY the keys listed in the schema — no extras, no missing keys.
+- Use null for any field that cannot be found in the text.
+- Dates must be ISO format YYYY-MM-DD.
+- integer and float fields must be JSON numbers, not strings.
+- Return ONLY the JSON object, no markdown, no explanation."""
+
+    text = invoke(
+        [{"role": "user", "content": [{"text": req.text}]}],
+        system=system,
+    )
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    return json.loads(text)
