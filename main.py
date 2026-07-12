@@ -5,6 +5,8 @@ import json
 import os
 
 import boto3
+import numpy as np
+import openai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,13 +27,15 @@ bedrock = boto3.client(
     aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
 )
 
-MODEL_ID = "amazon.nova-lite-v1:0"  # supports vision, no access request needed
+MODEL_ID = "amazon.nova-lite-v1:0"
+
+oai = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
-def invoke(messages: list, system: str | None = None) -> str:
+def invoke(messages: list, system: str | None = None, max_tokens: int = 1024) -> str:
     body: dict = {
         "messages": messages,
-        "inferenceConfig": {"max_new_tokens": 512},
+        "inferenceConfig": {"max_new_tokens": max_tokens},
     }
     if system:
         body["system"] = [{"text": system}]
@@ -41,6 +45,10 @@ def invoke(messages: list, system: str | None = None) -> str:
     )
     result = json.loads(response["body"].read())
     return result["output"]["message"]["content"][0]["text"].strip()
+
+
+def clean_json(text: str) -> str:
+    return text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
 
 # ── Image QA ──────────────────────────────────────────────────────────────────
@@ -65,12 +73,7 @@ def answer_image(req: ImageQARequest) -> ImageQAResponse:
         {
             "role": "user",
             "content": [
-                {
-                    "image": {
-                        "format": "png",
-                        "source": {"bytes": req.image_base64},
-                    },
-                },
+                {"image": {"format": "png", "source": {"bytes": req.image_base64}}},
                 {
                     "text": (
                         f"{req.question}\n\n"
@@ -103,12 +106,8 @@ class ExtractRequest(BaseModel):
 
 @app.post("/extract")
 def extract(req: ExtractRequest) -> dict:
-    text = invoke(
-        [{"role": "user", "content": [{"text": req.invoice_text}]}],
-        system=INVOICE_SYSTEM,
-    )
-    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(text)
+    text = invoke([{"role": "user", "content": [{"text": req.invoice_text}]}], system=INVOICE_SYSTEM)
+    return json.loads(clean_json(text))
 
 
 # ── Dynamic Extract ───────────────────────────────────────────────────────────
@@ -121,21 +120,71 @@ class DynamicExtractRequest(BaseModel):
 @app.post("/dynamic-extract")
 def dynamic_extract(req: DynamicExtractRequest) -> dict:
     schema_lines = "\n".join(f"  - {k}: {v}" for k, v in req.schema.items())
-    system = f"""You are a structured data extractor. Extract fields from the given text according to the schema below and return a single JSON object with no other text.
+    system = f"""You are a structured data extractor. Extract fields from the given text according to the schema and return a single JSON object with no other text.
 
 Schema (field: type):
 {schema_lines}
 
 Rules:
-- Return EXACTLY the keys listed in the schema — no extras, no missing keys.
-- Use null for any field that cannot be found in the text.
+- Return EXACTLY the keys listed — no extras, no missing keys.
+- Use null for fields not found in the text.
 - Dates must be ISO format YYYY-MM-DD.
 - integer and float fields must be JSON numbers, not strings.
 - Return ONLY the JSON object, no markdown, no explanation."""
 
+    text = invoke([{"role": "user", "content": [{"text": req.text}]}], system=system)
+    return json.loads(clean_json(text))
+
+
+# ── Rich Invoice Parse ────────────────────────────────────────────────────────
+
+RICH_INVOICE_SYSTEM = """You are a precise invoice parser. Extract structured data from the invoice text and return ONLY a valid JSON object matching this exact schema — no markdown, no explanation:
+
+{
+  "vendor": string (biller name exactly as written),
+  "currency": ISO 4217 code (USD/EUR/GBP/INR/JPY — infer from symbols like ₹=INR, £=GBP, €=EUR),
+  "total_amount": integer (main unit only, no decimals — convert spelled-out numbers, K suffix, Indian grouping),
+  "invoice_date": YYYY-MM-DD string,
+  "due_in_days": integer (Net 30 → 30, "two weeks" → 14, etc.),
+  "is_paid": boolean (true if paid, false if awaiting payment),
+  "priority": one of "low"/"normal"/"high"/"urgent",
+  "contact_email": string lowercased,
+  "line_items": array of {"sku": string, "quantity": integer, "unit_price": integer} in order of appearance,
+  "item_count": integer (number of line items)
+}"""
+
+
+class RichInvoiceRequest(BaseModel):
+    document_id: str
+    text: str
+    schema: dict | None = None
+
+
+@app.post("/parse-invoice")
+def parse_invoice(req: RichInvoiceRequest) -> dict:
     text = invoke(
         [{"role": "user", "content": [{"text": req.text}]}],
-        system=system,
+        system=RICH_INVOICE_SYSTEM,
+        max_tokens=1024,
     )
-    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(text)
+    return json.loads(clean_json(text))
+
+
+# ── Semantic Search (text-embedding-3-small) ──────────────────────────────────
+
+class SemanticSearchRequest(BaseModel):
+    query_id: str
+    query: str
+    candidates: list[str]
+
+
+@app.post("/semantic-search")
+def semantic_search(req: SemanticSearchRequest) -> dict:
+    texts = [req.query] + req.candidates
+    resp = oai.embeddings.create(model="text-embedding-3-small", input=texts)
+    embs = np.array([e.embedding for e in resp.data])
+    q_emb = embs[0]
+    c_embs = embs[1:]
+    sims = c_embs @ q_emb  # unit-normalised by default
+    top3 = np.argsort(-sims)[:3].tolist()
+    return {"ranking": top3}
