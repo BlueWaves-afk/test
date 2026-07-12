@@ -39,7 +39,7 @@ def answer_image(req: ImageQARequest) -> ImageQAResponse:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content([
         {
             "mime_type": "image/png",
@@ -77,7 +77,7 @@ class ExtractRequest(BaseModel):
 
 @app.post("/extract")
 def extract(req: ExtractRequest) -> dict:
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content(INVOICE_PROMPT + req.invoice_text)
     text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     return json.loads(text)
