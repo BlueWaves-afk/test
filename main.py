@@ -25,23 +25,22 @@ bedrock = boto3.client(
     aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
 )
 
-MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+MODEL_ID = "amazon.nova-lite-v1:0"  # supports vision, no access request needed
 
 
 def invoke(messages: list, system: str | None = None) -> str:
     body: dict = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 512,
         "messages": messages,
+        "inferenceConfig": {"max_new_tokens": 512},
     }
     if system:
-        body["system"] = system
+        body["system"] = [{"text": system}]
     response = bedrock.invoke_model(
         modelId=MODEL_ID,
         body=json.dumps(body),
     )
     result = json.loads(response["body"].read())
-    return result["content"][0]["text"].strip()
+    return result["output"]["message"]["content"][0]["text"].strip()
 
 
 # ── Image QA ──────────────────────────────────────────────────────────────────
@@ -67,15 +66,12 @@ def answer_image(req: ImageQARequest) -> ImageQAResponse:
             "role": "user",
             "content": [
                 {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": req.image_base64,
+                    "image": {
+                        "format": "png",
+                        "source": {"bytes": req.image_base64},
                     },
                 },
                 {
-                    "type": "text",
                     "text": (
                         f"{req.question}\n\n"
                         "Reply with only the raw answer value — no units, no extra text, "
@@ -108,7 +104,7 @@ class ExtractRequest(BaseModel):
 @app.post("/extract")
 def extract(req: ExtractRequest) -> dict:
     text = invoke(
-        [{"role": "user", "content": req.invoice_text}],
+        [{"role": "user", "content": [{"text": req.invoice_text}]}],
         system=INVOICE_SYSTEM,
     )
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
