@@ -4,10 +4,12 @@ import base64
 import json
 import os
 
-import anthropic
+import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 app = FastAPI()
 
@@ -17,8 +19,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
 # ── Image QA ──────────────────────────────────────────────────────────────────
@@ -35,44 +35,29 @@ class ImageQAResponse(BaseModel):
 @app.post("/answer-image", response_model=ImageQAResponse)
 def answer_image(req: ImageQARequest) -> ImageQAResponse:
     try:
-        base64.b64decode(req.image_base64, validate=True)
+        image_bytes = base64.b64decode(req.image_base64, validate=True)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    message = client.messages.create(
-        model="claude-opus-4-8",
-        max_tokens=256,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": req.image_base64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"{req.question}\n\n"
-                            "Reply with only the raw answer value — no units, no extra text, "
-                            "no explanation. For numbers, use digits only (e.g. '4089.35')."
-                        ),
-                    },
-                ],
-            }
-        ],
-    )
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content([
+        {
+            "mime_type": "image/png",
+            "data": image_bytes,
+        },
+        (
+            f"{req.question}\n\n"
+            "Reply with only the raw answer value — no units, no extra text, "
+            "no explanation. For numbers, use digits only (e.g. '4089.35')."
+        ),
+    ])
 
-    return ImageQAResponse(answer=message.content[0].text.strip())
+    return ImageQAResponse(answer=response.text.strip())
 
 
 # ── Invoice Extract ───────────────────────────────────────────────────────────
 
-INVOICE_SYSTEM = """You are an invoice data extractor. Given raw invoice text, extract exactly these 6 fields and return valid JSON with no other text:
+INVOICE_PROMPT = """Extract these 6 fields from the invoice text below and return valid JSON with no other text:
 - invoice_no: string (null if not found)
 - date: string in YYYY-MM-DD format (null if not found)
 - vendor: string — the seller/vendor name (null if not found)
@@ -80,7 +65,10 @@ INVOICE_SYSTEM = """You are an invoice data extractor. Given raw invoice text, e
 - tax: number — tax amount only, not grand total (null if not found)
 - currency: string e.g. INR, USD (null if not found)
 
-Return ONLY the JSON object, no markdown, no explanation."""
+Return ONLY the JSON object, no markdown, no explanation.
+
+Invoice text:
+"""
 
 
 class ExtractRequest(BaseModel):
@@ -89,10 +77,7 @@ class ExtractRequest(BaseModel):
 
 @app.post("/extract")
 def extract(req: ExtractRequest) -> dict:
-    message = client.messages.create(
-        model="claude-opus-4-8",
-        max_tokens=512,
-        system=INVOICE_SYSTEM,
-        messages=[{"role": "user", "content": req.invoice_text}],
-    )
-    return json.loads(message.content[0].text.strip())
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(INVOICE_PROMPT + req.invoice_text)
+    text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    return json.loads(text)
